@@ -214,6 +214,33 @@ def handle_client(client, address):
                     print("ERROR: Packet has no device_id")
                     continue
 
+                # Presence heartbeat (keeps device online while powered on network).
+                if packet.get("heartbeat") is True:
+                    now = datetime.now()
+                    with devices_lock:
+                        if device_id not in devices:
+                            if len(devices) >= MAX_DEVICES:
+                                with statistics_lock:
+                                    total_errors += 1
+                                print("Maximum device count reached")
+                                continue
+
+                            devices[device_id] = create_device(device_id)
+                            print(f"NEW DEVICE: {device_id}")
+
+                        device = devices[device_id]
+                        device["ip_address"] = ip_address
+                        device["online"] = True
+                        device["last_seen"] = now
+
+                    try:
+                        client.sendall(b"ACK:0\n")
+                    except Exception:
+                        with statistics_lock:
+                            total_errors += 1
+                        break
+                    continue
+
                 # Validate transport sequence.
                 if "sequence" not in packet:
                     with statistics_lock:
