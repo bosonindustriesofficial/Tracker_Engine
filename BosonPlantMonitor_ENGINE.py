@@ -6,7 +6,7 @@ import csv
 import os
 import time
 import re
-from datetime import datetime
+from datetime import datetime, date
 
 
 # ============================================================
@@ -18,7 +18,22 @@ SERVER_PORT = 5000
 
 MAX_DEVICES = 8
 OFFLINE_TIMEOUT = 10          # seconds
-CSV_FILE = "plant_data.csv"
+
+LOG_ROOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "logs",
+)
+
+CSV_HEADER = [
+    "timestamp",
+    "device_id",
+    "ip_address",
+    "sequence",
+    "barcode_id",
+    "product_code",
+    "batch",
+    "barcode_sequence",
+]
 
 
 # ============================================================
@@ -108,59 +123,101 @@ def create_device(device_id):
 
 
 # ============================================================
-# CSV LOGGER
+# CSV LOGGER (daily file: logs/Nov2026/13Nov2026.csv)
 # ============================================================
 
-
-def initialize_csv():
-    file_exists = os.path.exists(CSV_FILE)
-
-    file = open(
-        CSV_FILE,
-        "a",
-        newline="",
-        encoding="utf-8"
-    )
-
-    writer = csv.writer(file)
-
-    if not file_exists:
-        writer.writerow([
-            "timestamp",
-            "device_id",
-            "ip_address",
-            "sequence",
-            "barcode_id",
-            "product_code",
-            "batch",
-            "barcode_sequence"
-        ])
-        file.flush()
-
-    return file, writer
-
-
-csv_file, csv_writer = initialize_csv()
+csv_file = None
+csv_writer = None
+current_log_date = None
+current_csv_path = None
 csv_lock = threading.Lock()
 
 
+def daily_csv_path(for_day):
+    month_dir = for_day.strftime("%b%Y")
+    file_name = for_day.strftime("%d%b%Y") + ".csv"
+    return os.path.join(LOG_ROOT, month_dir, file_name)
+
+
+def ensure_daily_csv():
+    global csv_file
+    global csv_writer
+    global current_log_date
+    global current_csv_path
+
+    today = datetime.now().date()
+
+    if (
+        current_log_date == today
+        and csv_file is not None
+        and current_csv_path
+        and os.path.isfile(current_csv_path)
+    ):
+        return
+
+    if csv_file is not None:
+        try:
+            csv_file.close()
+        except Exception:
+            pass
+        csv_file = None
+        csv_writer = None
+
+    csv_path = daily_csv_path(today)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    file_exists = os.path.isfile(csv_path)
+
+    csv_file = open(
+        csv_path,
+        "a",
+        newline="",
+        encoding="utf-8",
+    )
+
+    csv_writer = csv.writer(csv_file)
+
+    if not file_exists:
+        csv_writer.writerow(CSV_HEADER)
+        csv_file.flush()
+
+    current_log_date = today
+    current_csv_path = csv_path
+
+
+def get_active_csv_path():
+    if current_csv_path:
+        return current_csv_path
+    return daily_csv_path(datetime.now().date())
+
+
 def log_packet(packet):
+    global total_errors
+
     timestamp = packet["_received_time"].strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
-    with csv_lock:
-        csv_writer.writerow([
-            timestamp,
-            packet.get("device_id"),
-            packet.get("_ip_address"),
-            packet.get("sequence"),
-            packet.get("barcode_id"),
-            packet.get("product_code"),
-            packet.get("batch"),
-            packet.get("barcode_sequence")
-        ])
-        csv_file.flush()
+    try:
+        with csv_lock:
+            ensure_daily_csv()
+
+            csv_writer.writerow([
+                timestamp,
+                packet.get("device_id"),
+                packet.get("_ip_address"),
+                packet.get("sequence"),
+                packet.get("barcode_id"),
+                packet.get("product_code"),
+                packet.get("batch"),
+                packet.get("barcode_sequence")
+            ])
+            csv_file.flush()
+
+    except OSError as error:
+        with statistics_lock:
+            total_errors += 1
+        print(f"ERROR: CSV write failed: {error}")
 
 
 # ============================================================
@@ -484,13 +541,19 @@ def start_engine():
 
 def stop_engine():
     global server_running
+    global csv_file
+    global csv_writer
 
     server_running = False
 
-    try:
-        csv_file.close()
-    except Exception:
-        pass
+    with csv_lock:
+        try:
+            if csv_file is not None:
+                csv_file.close()
+        except Exception:
+            pass
+        csv_file = None
+        csv_writer = None
 
 
 def get_devices_snapshot():
@@ -513,10 +576,14 @@ def get_statistics():
 
 
 def get_server_config():
+    with csv_lock:
+        csv_path = get_active_csv_path()
+
     return {
         "server_host": SERVER_HOST,
         "server_port": SERVER_PORT,
         "max_devices": MAX_DEVICES,
         "offline_timeout": OFFLINE_TIMEOUT,
-        "csv_file": CSV_FILE
+        "log_root": LOG_ROOT,
+        "csv_file": csv_path,
     }
